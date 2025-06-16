@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <BH1750.h>
+#include "wifi_manager.h"
 #include "DHT.h"
 
 // Cấu hình các chân
@@ -63,6 +64,12 @@ void setup()
   pinMode(SOIL_SENSOR_PIN, INPUT);
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, LOW);
+
+
+  WiFiManager_Init();
+  if (WiFiManager_IsConnected()) {
+    Serial.println("Ready to run application");
+  }
 }
 
 void loop()
@@ -173,4 +180,6 @@ void loop()
       digitalWrite(RELAY_PIN, LOW);
     }
   }
+  
+  WiFiManager_Loop();
 }
