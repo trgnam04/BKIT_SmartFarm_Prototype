@@ -2,184 +2,163 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <BH1750.h>
+#include <DHT.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include "wifi_manager.h"
-#include "DHT.h"
 
-// Cấu hình các chân
-#define DHTPIN 14
-#define DHTTYPE DHT11
-#define RAIN_SENSOR_PIN 32
-#define SOIL_SENSOR_PIN 35
-#define RELAY_PIN 26
-#define RAIN_THRESHOLD 2000
+// --------- Pin & hằng số ---------
+#define DHTPIN 32
+#define DHTTYPE DHT21
+#define RAIN_SENSOR_PIN 35
+#define SOIL_SENSOR_PIN 34
+#define RELAY_PIN 19
 
-// Thời gian chu kỳ của từng nhiệm vụ (đơn vị: ms)
-#define SENSOR_READ_INTERVAL 5000
-#define LCD_UPDATE_INTERVAL 50
-#define RELAY_CONTROL_INTERVAL 500
-#define SWITCH_PAGE_INTERVAL 4000
+#define HUMIDITY_MIN 25
+#define HUMIDITY_MAX 50
 
-// Biến lưu thời gian lần cuối thực hiện từng nhiệm vụ
-unsigned long lastSensorReadTime = 0;
-unsigned long lastLCDUpdateTime = 0;
-unsigned long lastRelayControlTime = 0;
-unsigned long lastSwitchPageTime = 0;
+constexpr uint32_t T_SENSOR   = 1000;   // ms
+constexpr uint32_t T_LCD      = 250;    // ms
+constexpr uint32_t T_PAGE     = 4000;   // ms
+constexpr uint32_t T_RELAY    = 500;    // ms
+constexpr uint32_t T_SEND     = 10000;  // ms
 
-// Biến lưu dữ liệu sensor
-float temperature = 0;
-float humidity = 0;
-int rainValue = 0;
-int soilValue = 0;
-float soilPercent = 0;
-float fluxValue = 0;
+const char* POST_URL = "http://ems.thebestits.vn/Value/GetData";
 
-bool displayPage = 0;
-
-// Khởi tạo cảm biến và LCD
-DHT dht(DHTPIN, DHTTYPE);
-BH1750 lightMeter;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+BH1750 lightMeter;
+DHT dht(DHTPIN, DHTTYPE);
 
-void setup()
-{
-  Serial.begin(115200);
-  delay(1000);
+DynamicJsonDocument doc(256);
 
-  Wire.begin(21, 22);
-  lcd.begin(16, 2);
-  lcd.backlight();
+// --------- Biến runtime ---------
+uint32_t tLastSensor{0}, tLastLCD{0}, tLastPage{0},
+         tLastRelay{0},  tLastSend{0};
+bool page = 0, pumpOn = 0;
 
-  dht.begin();
-  if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
-  {
-    Serial.println("Cant connect to BH1750 Sensor");
-    // while (1)
-    //   ;
+float  temp = NAN, hum = NAN, lux = 0;
+uint16_t rainRaw = 0, soilRaw = 0;   // 0‑4095
+float soilPct = 0;
+
+// --------- Hàm tiện ích ---------
+uint16_t analogAverage(uint8_t pin, uint8_t samples = 8) {
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < samples; ++i) {
+    sum += analogRead(pin);
+    delayMicroseconds(150);          // ~12‑bit ADC cần >130 µs
   }
-  else
-  {
-    Serial.println("Init BH1750 Successful");
-  }
-  pinMode(RAIN_SENSOR_PIN, INPUT);
-  pinMode(SOIL_SENSOR_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);
-
-
-  WiFiManager_Init();
-  if (WiFiManager_IsConnected()) {
-    Serial.println("Ready to run application");
-  }
+  return sum / samples;
 }
 
-void loop()
-{
-  unsigned long currentMillis = millis();
-
-  // 1. Đọc sensor định kỳ
-  if (currentMillis - lastSensorReadTime >= SENSOR_READ_INTERVAL)
-  {
-    lastSensorReadTime = currentMillis;
-
-    temperature = dht.readTemperature();
-    humidity = dht.readHumidity();
-    rainValue = analogRead(RAIN_SENSOR_PIN);
-    soilValue = analogRead(SOIL_SENSOR_PIN);
-    soilPercent = map(soilValue, 0, 4095, 100, 0);
-    fluxValue = lightMeter.readLightLevel();
-
-    Serial.println("----- Data -----");
-    if (isnan(temperature) || isnan(humidity))
-    {
-      Serial.println(" DHT11 error");
-    }
-    else
-    {
-      Serial.printf(" Temperature: %.1f C\n", temperature);
-      Serial.printf(" Humidity: %.0f %%\n", humidity);
-    }
-    Serial.printf(" Rain sensor: %d \n", rainValue);
-    Serial.printf(" Soil moisture: %.0f %%\n", soilPercent);
-    Serial.printf(" Light Intensity: %.0f lux\n", fluxValue);
-    Serial.println("----------------------------");
+bool readDHT(float &t, float &h) {
+  t = dht.readTemperature(false);
+  h = dht.readHumidity(false);
+  if (isnan(t) || isnan(h)) {                 // đọc lại 1 lần
+    delay(50);
+    t = dht.readTemperature(false);
+    h = dht.readHumidity(false);
   }
+  return !(isnan(t) || isnan(h));
+}
 
-  // 2. Hiển thị LCD với tần số cao hơn
-  // Thêm biến điều khiển trang hiển thị
-  if (currentMillis - lastSwitchPageTime >= SWITCH_PAGE_INTERVAL)
-  {
-
-    lastSwitchPageTime = currentMillis;
-
-    // Đổi trang sau mỗi lần cập nhật
-    displayPage = !displayPage;
-    lcd.clear(); // Xoá màn hình trước khi vẽ trang mới
-  }
-
-  if (currentMillis - lastLCDUpdateTime >= LCD_UPDATE_INTERVAL)
-  {
-    lastLCDUpdateTime = currentMillis;
-
-    if (displayPage == 0)
-    {
-      // Trang 1: nhiệt độ, độ ẩm, đất, mưa
-      if (isnan(temperature) || isnan(humidity))
-      {
-        lcd.setCursor(0, 0);
-        lcd.print(" DHT11 error!");
-      }
-      else
-      {
-        lcd.setCursor(0, 0);
-        lcd.print("T:");
-        lcd.print(temperature, 1);
-        lcd.print((char)223);
-        lcd.print("C ");
-        lcd.print("H:");
-        lcd.print(humidity, 0);
-        lcd.print("%");
-      }
-
-      lcd.setCursor(0, 1);
-      lcd.print("HE: ");
-      lcd.print(soilPercent, 0);
-      lcd.print("% ");
-      if (rainValue < RAIN_THRESHOLD)
-      {
-        lcd.print("R-ON ");
-      }
-      else
-      {
-        lcd.print("UR-OFF");
-      }
-    }
-    else
-    {
-      lcd.setCursor(0, 0);
-      lcd.print("Lux: ");
-      lcd.print(fluxValue);
-      lcd.print(" lx"); // Đơn vị gọn lại (lux → lx)
-
-      lcd.setCursor(0, 1);
-      lcd.print("Rain: ");
-      lcd.print(rainValue);
-    }
-  }
-
-  // 3. Điều khiển relay độc lập
-  if (currentMillis - lastRelayControlTime >= RELAY_CONTROL_INTERVAL)
-  {
-    lastRelayControlTime = currentMillis;
-
-    if (rainValue < RAIN_THRESHOLD)
-    {
-      digitalWrite(RELAY_PIN, HIGH);
-    }
-    else
-    {
-      digitalWrite(RELAY_PIN, LOW);
-    }
-  }
+bool sendToServer() {
+  if (WiFi.status() != WL_CONNECTED) return false;  
   
-  WiFiManager_Loop();
+  doc["temperature"] = temp;
+  doc["humidity"]    = hum;
+  doc["rainValue"]   = rainRaw;  
+  doc["soilPercent"] = soilPct;
+  doc["lux"]         = lux;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  HTTPClient http;
+  http.begin(POST_URL);
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(3000);
+
+  int code = http.POST(payload);
+  Serial.printf("[HTTP] POST… code=%d\n", code);
+  if (code > 0) Serial.println(http.getString());
+
+  http.end();
+  return (code >= 200 && code < 300);
+}
+
+
+// --------- setup ---------
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  lcd.begin(16, 2); lcd.backlight();
+  dht.begin();
+  lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH);      // HIGH = off (tùy module)
+
+  // TODO: WiFiManager_Init();
+}
+
+// --------- loop ---------
+void loop() {
+  uint32_t now = millis();
+
+  // 1. Đọc cảm biến
+  if (now - tLastSensor >= T_SENSOR) {
+    tLastSensor = now;
+
+    readDHT(temp, hum);
+    lux      = lightMeter.readLightLevel();
+    rainRaw  = analogAverage(RAIN_SENSOR_PIN);
+    soilRaw  = analogAverage(SOIL_SENSOR_PIN);
+    soilPct  = map(soilRaw, 0, 4095, 100, 0);
+
+    // debug
+    Serial.printf("T=%.1fC H=%.0f%% Soil=%.0f%% Rain=%u Lux=%.0f\n",
+                  temp, hum, soilPct, rainRaw, lux);
+  }
+
+  // 2. Điều khiển bơm
+  if (now - tLastRelay >= T_RELAY) {
+    tLastRelay = now;
+    if (soilPct < HUMIDITY_MIN && !pumpOn) {
+      digitalWrite(RELAY_PIN, LOW);   // bật
+      pumpOn = true;
+    } else if (soilPct > HUMIDITY_MAX && pumpOn) {
+      digitalWrite(RELAY_PIN, HIGH);  // tắt
+      pumpOn = false;
+    }
+  }
+
+  // 3. Gửi server
+  if (now - tLastSend >= T_SEND) {
+    if (sendToServer()) tLastSend = millis();   // cập nhật SAU khi gửi
+  }
+
+  // 4. Cập nhật LCD
+  if (now - tLastPage >= T_PAGE) {
+    tLastPage = now; page = !page; lcd.clear();
+  }
+  if (now - tLastLCD >= T_LCD) {
+    tLastLCD = now;
+    if (!page) {
+      if (isnan(temp) || isnan(hum)) {
+        lcd.setCursor(0,0); lcd.print("DHT21 error   ");
+      } else {
+        lcd.setCursor(0,0);
+        lcd.printf("T:%.1fC H:%.0f%% ", temp, hum);
+      }
+      lcd.setCursor(0,1);
+      lcd.printf("Soil:%02.0f%% %s ", soilPct, pumpOn?"ON ":"OFF");
+    } else {
+      lcd.setCursor(0,0); lcd.printf("Lux:%05.0f lx", lux);
+      lcd.setCursor(0,1); lcd.printf("Rain:%4u     ", rainRaw);
+    }
+  }
+
+  WiFiManager_Loop();  // nếu dùng
 }
